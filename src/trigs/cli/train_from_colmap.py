@@ -289,6 +289,31 @@ class TrigsColmapArgs:
     mask_missing_value: float = 0.0
     """Fallback mask value when error_on_missing_mask=False. 0=background, 1=foreground."""
 
+    depth_root: Path | None = None
+    """Optional measured-depth root (e.g. Kinect depth registered to the colour
+    cameras). Layout mirrors images/ and masks/:
+    depth_root/<camera_folder>/<frame>.png (uint16, metres = value x
+    --depth-scale, 0 = invalid) or <frame>.npy (float32 metres; 0/non-finite =
+    invalid). Z-depth along the colour camera's optical axis, registered to the
+    undistorted image the trainer renders (sparse/0 intrinsics), at any
+    resolution with the image's aspect ratio (half-res is typical). Enables
+    depth metrics; the loss is weighted by --config.lambda-depth (0 = off)."""
+
+    depth_pattern: str = "{frame:06d}.png"
+    """Filename pattern for depth maps inside each camera folder. A missing
+    .png falls back to the same name with .npy (and vice versa)."""
+
+    depth_scale: float = 0.001
+    """Metres per uint16 unit for PNG depth (0.001 = millimetres). Ignored
+    for .npy (already metres)."""
+
+    depth_cache_size: int = 300
+    """LRU cache size for lazy depth tensors (float32; ~2 MB each at 540x960)."""
+
+    error_on_missing_depth: bool = True
+    """If True, raise when a depth map is missing. If False, that view is
+    simply not depth-supervised."""
+
     foregrounds_root: Path | None = None
     """Optional decontaminated straight-foreground RGB root. Expected layout:
     foregrounds/<camera_folder>/<frame>.png. When set, masked composite training
@@ -1086,6 +1111,151 @@ class _LazyGTMasks:
         self._cache[key] = mask
         return mask
 
+def _read_depth_metres(path: Path, depth_scale: float) -> np.ndarray:
+    """Load a depth map as float32 metres; invalid pixels are 0."""
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        d = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32)
+    elif suffix == ".png":
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise RuntimeError(f"Could not read depth PNG: {path}")
+        if raw.dtype != np.uint16 or raw.ndim != 2:
+            raise RuntimeError(
+                f"Depth PNG must be single-channel uint16, got {raw.dtype} "
+                f"shape {raw.shape}: {path}"
+            )
+        d = raw.astype(np.float32) * np.float32(depth_scale)
+    else:
+        raise RuntimeError(f"Unsupported depth file type {suffix!r}: {path} (use .png or .npy)")
+    if d.ndim == 3 and d.shape[-1] == 1:
+        d = d[..., 0]
+    if d.ndim != 2:
+        raise RuntimeError(f"Depth map must be [H, W], got shape {d.shape}: {path}")
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(d) & (d > 0)
+    return np.where(ok, d, np.float32(0.0)).astype(np.float32)
+
+
+class _LazyGTDepths:
+    """
+    gt_depths[frame_offset][cam_pos] -> float32 tensor [h, w] in metres
+    (0 = invalid), or None for a missing file when error_on_missing=False.
+
+    Layout and frame numbering mirror _LazyGTMasks / the images:
+        depth_root/<camera_folder>/<depth_pattern.format(frame=...)>
+
+    The map keeps its own resolution (typically half the image's); the trainer
+    pools the render onto it rather than upsampling the sparse target. A map
+    finer than the render is reduced to the render grid by nearest
+    sampling, which never blends valid depths with holes. The aspect ratio
+    must match the rendered image's.
+    """
+
+    _ASPECT_TOL = 0.01
+
+    def __init__(
+        self,
+        depth_root: Path,
+        cam_folders_by_pos: Sequence[str],
+        *,
+        source_start_frame: int,
+        target_hw_by_pos: Sequence[tuple[int, int]],
+        depth_pattern: str = "{frame:06d}.png",
+        depth_scale: float = 0.001,
+        cache_size: int = 300,
+        error_on_missing: bool = True,
+        raw_warps_by_pos: Sequence[RawWarp | None] | None = None,
+    ) -> None:
+        self._root = Path(depth_root)
+        self._cam_folders_by_pos = list(cam_folders_by_pos)
+        self._source_start_frame = int(source_start_frame)
+        self._target_hw_by_pos = [(int(h), int(w)) for h, w in target_hw_by_pos]
+        self._pattern = str(depth_pattern)
+        self._depth_scale = float(depth_scale)
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_size = max(1, int(cache_size))
+        self._error_on_missing = bool(error_on_missing)
+        if len(self._target_hw_by_pos) != len(self._cam_folders_by_pos):
+            raise ValueError("target_hw_by_pos and cam_folders_by_pos lengths differ")
+        warped = [
+            self._cam_folders_by_pos[i]
+            for i, w in enumerate(raw_warps_by_pos or [])
+            if w is not None
+        ]
+        if warped:
+            # The depth contract is "registered to the undistorted image the
+            # trainer renders"; with a distorted sparse/0 model the trainer
+            # renders a re-derived pinhole camera (new K + ROI crop) that the
+            # depth producer cannot know about.
+            raise ValueError(
+                "Depth supervision needs undistorted (PINHOLE/SIMPLE_PINHOLE) cameras in the "
+                f"COLMAP model; cameras {warped[:6]} carry distortion and are undistorted + "
+                "ROI-cropped at load time, so registered depth would not line up."
+            )
+
+    def __getitem__(self, frame_offset: int) -> _FrameProxy:
+        return _FrameProxy(self, int(frame_offset))
+
+    def _path(self, frame_offset: int, cam_pos: int) -> Path:
+        frame_number = self._source_start_frame + int(frame_offset)
+        folder = self._cam_folders_by_pos[int(cam_pos)]
+        path = self._root / folder / self._pattern.format(frame=frame_number)
+        if not path.exists():
+            alt = {".png": ".npy", ".npy": ".png"}.get(path.suffix.lower())
+            if alt is not None and path.with_suffix(alt).exists():
+                return path.with_suffix(alt)
+        return path
+
+    def validate_boundaries(self, n_frames: int) -> None:
+        """Fail before GPU training if first/last depth maps are absent or
+        have the wrong aspect ratio."""
+        if int(n_frames) <= 0:
+            raise ValueError(f"n_frames must be positive, got {n_frames}")
+        for frame_offset in sorted({0, int(n_frames) - 1}):
+            for cam_pos in range(len(self._cam_folders_by_pos)):
+                path = self._path(frame_offset, cam_pos)
+                if not path.exists():
+                    raise FileNotFoundError(
+                        "Depth boundary validation failed before training: "
+                        f"frame_offset={frame_offset}, cam_pos={cam_pos}: {path}. "
+                        f"Mapping is source_start_frame ({self._source_start_frame}) "
+                        "+ frame_offset, the same numbering as images/ and masks/."
+                    )
+                self._get(frame_offset, cam_pos)
+
+    def _fit(self, d: np.ndarray, cam_pos: int, path: Path) -> np.ndarray:
+        H, W = self._target_hw_by_pos[int(cam_pos)]
+        h, w = int(d.shape[0]), int(d.shape[1])
+        if abs((h / w) / (H / W) - 1.0) > self._ASPECT_TOL:
+            raise RuntimeError(
+                f"Depth map aspect ratio does not match the image: depth {h}x{w} "
+                f"(HxW) vs image {H}x{W}: {path}"
+            )
+        if h > H or w > W:
+            d = cv2.resize(d, (W, H), interpolation=cv2.INTER_NEAREST)
+        return d
+
+    def _get(self, frame_offset: int, cam_pos: int) -> torch.Tensor | None:
+        key = (int(frame_offset), int(cam_pos))
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        path = self._path(frame_offset, cam_pos)
+        if not path.exists():
+            if self._error_on_missing:
+                raise FileNotFoundError(
+                    f"Missing depth for frame_offset={frame_offset}, cam_pos={cam_pos}: {path}"
+                )
+            return None
+        d = self._fit(_read_depth_metres(path, self._depth_scale), cam_pos, path)
+        tensor = torch.from_numpy(np.ascontiguousarray(d, dtype=np.float32))
+        if len(self._cache) >= self._cache_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = tensor
+        return tensor
+
+
 @torch.no_grad()
 def _apply_split_budget_to_prebuilt_params(
     params,
@@ -1444,6 +1614,7 @@ class ColmapScene:
     gt_images: object
     gt_alphas: object
     gt_times: object
+    gt_depths: object = None
 
 
 def build_colmap_scene(args: TrigsColmapArgs) -> ColmapScene:
@@ -1708,6 +1879,33 @@ def build_colmap_scene(args: TrigsColmapArgs) -> ColmapScene:
     else:
         gt_alphas = _DummyGTAlphas()
 
+    gt_depths = None
+    if getattr(args, "depth_root", None) is not None:
+        gt_depths = _LazyGTDepths(
+            depth_root=args.depth_root,
+            cam_folders_by_pos=cam_folders_by_pos,
+            source_start_frame=args.start_frame,
+            target_hw_by_pos=hw_by_pos,
+            depth_pattern=args.depth_pattern,
+            depth_scale=args.depth_scale,
+            cache_size=args.depth_cache_size,
+            error_on_missing=args.error_on_missing_depth,
+            raw_warps_by_pos=raw_warps_by_pos,
+        )
+        if args.error_on_missing_depth:
+            gt_depths.validate_boundaries(n_frames)
+        first = next(
+            (d for d in (gt_depths[0][cp] for cp in range(n_cameras)) if d is not None), None,
+        )
+        log.info(
+            "Using measured depth from %s (pattern %s, scale %g m/unit)%s; "
+            "lambda_depth=%g from step %d, loss %s",
+            args.depth_root, args.depth_pattern, args.depth_scale,
+            "" if first is None else f", maps {tuple(first.shape)} vs images {hw_by_pos[0]}",
+            args.config.lambda_depth, args.config.depth_loss_start_step,
+            args.config.depth_loss_type,
+        )
+
     frame_timestamps_file = args.data_dir / "frame_timestamps.json"
     sync_file = args.data_dir / "sync.json"
     gt_times = _build_gt_times_from_ladder(
@@ -1752,6 +1950,7 @@ def build_colmap_scene(args: TrigsColmapArgs) -> ColmapScene:
         parser=parser, dataset=dataset, training_cam_ids=list(training_cam_ids),
         cam_folders_by_pos=cam_folders_by_pos, cameras=cameras, n_frames=n_frames,
         gt_images=gt_images, gt_alphas=gt_alphas, gt_times=gt_times,
+        gt_depths=gt_depths,
     )
 
 
@@ -1845,6 +2044,8 @@ def main(args: TrigsColmapArgs | None = None) -> None:
             "Viewer snapshots every %d steps -> %s (view: viewer.py --watch %s)",
             args.config.viewer_snapshot_every, snap_dir, snap_dir,
         )
+    if float(args.config.lambda_depth) > 0.0 and args.depth_root is None:
+        raise ValueError("--config.lambda-depth > 0 requires --depth-root")
     if args.end_frame < args.start_frame:
         raise ValueError(
             f"end_frame ({args.end_frame}) must be >= start_frame ({args.start_frame})"
@@ -2051,6 +2252,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
     parser, training_cam_ids = scene.parser, scene.training_cam_ids
     cameras, n_frames = scene.cameras, scene.n_frames
     gt_images, gt_alphas, gt_times = scene.gt_images, scene.gt_alphas, scene.gt_times
+    gt_depths = scene.gt_depths
 
     # -- Step 5: train ------------------------------------------------------
     tb_writer = None
@@ -2148,6 +2350,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
                 # The whole model only has to fit in host RAM; assembling it
                 # on the GPU for the save would OOM at the end of a long run.
                 result_device="cpu",
+                gt_depths_per_frame=gt_depths,
             )
         else:
             result = trainer.train_from_params(
@@ -2161,6 +2364,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
                 config=args.config,
                 gt_times_per_frame=gt_times,
                 writer=tb_writer,
+                gt_depths_per_frame=gt_depths,
             )
     finally:
         if tb_writer is not None:

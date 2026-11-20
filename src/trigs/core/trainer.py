@@ -395,6 +395,27 @@ class TrigsTrainingConfig:
     lambda_alpha_outside_mask: float = 0.1
     lambda_alpha_mask: float = 0.5
     alpha_loss_eps: float = 1e-4
+    # Depth supervision from measured depth maps (COLMAP CLI: --depth-root).
+    # 0 = off. The render's expected depth (sum w z / sum w, area-pooled onto
+    # the depth map's grid) is compared with the measured depth where the
+    # target is valid, the mask is >= depth_loss_mask_min, the pooled render
+    # opacity is >= depth_alpha_min, and the target has no hole or jump within
+    # depth_edge_px pixels. Frame-normalised like the alpha terms. See
+    # trigs.core.depth for the loss types; huber_log is a relative error
+    # (log-depth), quadratic within +-depth_huber_delta (~ToF noise) and
+    # linear beyond it. When a depth root is given with lambda_depth = 0,
+    # depth is still rendered to log loss/depth and depth/* eval metrics.
+    lambda_depth: float = 0.0
+    depth_loss_start_step: int = 0
+    depth_loss_type: str = "huber_log"
+    depth_huber_delta: float = 0.02
+    depth_loss_mask_min: float = 0.5
+    depth_alpha_min: float = 0.5
+    depth_edge_px: int = 1
+    depth_edge_rel_jump: float = 0.05
+    # World (render) units per metre of measured depth. 1.0 for a metric
+    # COLMAP model (e.g. Kinect-calibrated sparse/0).
+    depth_units_per_metre: float = 1.0
     psnr_eval_every: int = 1000
     psnr_eval_num_samples: int = 48
     psnr_eval_seed: int = 12345
@@ -1784,9 +1805,12 @@ class TrigsTrainer:
         return_optimizer_state: bool = False,
         frame_weights: Optional[Sequence[float]] = None,
         progress_bar: Optional[Any] = None,
+        gt_depths_per_frame: Optional[Any] = None,
     ) -> TrigsTrainingResult:
         """``frame_weights`` (aligned with ``frame_indices``) sets the frame choice of every
-        step directly; chunked training uses it to carry the fast-frame top-up into chunk calls."""
+        step directly; chunked training uses it to carry the fast-frame top-up into chunk calls.
+        ``gt_depths_per_frame[frame][cam]`` (metres, [h, w], 0 = invalid) enables depth
+        supervision/metrics (see ``lambda_depth``)."""
         n_primitives = params["means"].shape[0]
 
         # Sequence time bounds for temporal-hierarchy interval clipping.
@@ -1845,6 +1869,7 @@ class TrigsTrainer:
             frame_indices=frame_indices,
             frame_weights_override=frame_weights,
             progress_bar=progress_bar,
+            gt_depths=gt_depths_per_frame,
         )
         result = self._package_result(params, metrics)
         if return_optimizer_state:
@@ -1864,6 +1889,7 @@ class TrigsTrainer:
         gt_times_per_frame: Optional[Dict[int, List[float]]] = None,
         writer: Optional[Any] = None,
         result_device: str | torch.device | None = None,
+        gt_depths_per_frame: Optional[Any] = None,
     ) -> TrigsTrainingResult:
         """Temporally chunked training with seam-safe ownership.
 
@@ -2473,6 +2499,7 @@ class TrigsTrainer:
                     initial_optimizer_step=int(global_step_offset),
                     return_optimizer_state=interleaved,
                     progress_bar=pbar,
+                    gt_depths_per_frame=gt_depths_per_frame,
                     frame_weights=(
                         None if fast_weights is None
                         or all(abs(fast_weights[fi] - 1.0) < 1e-9 for fi in chunk_frames)
@@ -2563,6 +2590,7 @@ class TrigsTrainer:
                     config=config,
                     gt_images_per_frame=gt_images_per_frame,
                     gt_alphas_per_frame=gt_alphas_per_frame,
+                    gt_depths_per_frame=gt_depths_per_frame,
                     gt_times_per_frame=gt_times_per_frame,
                     cull_threshold=cull_threshold,
                     step=global_step_offset,
@@ -3259,7 +3287,11 @@ class TrigsTrainer:
         sh_degree: int,
         config: TrigsTrainingConfig,
         step: int | None = None,
+        with_depth: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Dict]:
+        """``with_depth`` renders RGB+D: the colours stay the first return
+        value and the accumulated depth sum_i w_i z_i ([1, H, W, 1]) goes to
+        ``info["render_depth_acc"]``."""
         active_idx = self._active_idx_for_time(params, t, config, step=step)
         if active_idx.numel() == 0:
             # gsplat 1.5.3 divides means.numel() by N * 3 in its native
@@ -3329,7 +3361,11 @@ class TrigsTrainer:
             height=cameras.height_for(cam_idx),
             sh_degree=sh_degree,
             packed=False,
+            **({"render_mode": "RGB+D"} if with_depth else {}),
         )
+        if with_depth:
+            info["render_depth_acc"] = render_colors[..., -1:]
+            render_colors = render_colors[..., :-1]
 
         if info.get("means2d") is not None and info["means2d"].requires_grad:
             info["means2d"].retain_grad()
@@ -3620,6 +3656,45 @@ class TrigsTrainer:
     # -------------------------------------------------------------------------
     # Step 3: Pool-aware relocation
     # -------------------------------------------------------------------------
+
+    def _depth_loss_for_view(
+        self,
+        render_alphas: Tensor,
+        info: Dict,
+        gt_depths_per_frame: Any,
+        gt_alphas_per_frame: Any,
+        frame_idx: int,
+        cam_idx: int,
+        config: TrigsTrainingConfig,
+        with_stats: bool = False,
+    ) -> Optional[tuple[Tensor, Dict[str, Tensor]]]:
+        """Depth loss for one view rendered with ``with_depth=True``; None when
+        that view has no depth map (missing file with error_on_missing off)."""
+        from .depth import depth_supervision
+
+        target = gt_depths_per_frame[frame_idx][cam_idx]
+        if not torch.is_tensor(target):
+            return None
+        mask = None
+        if gt_alphas_per_frame is not None:
+            try:
+                mask_obj = gt_alphas_per_frame[frame_idx][cam_idx]
+            except Exception:
+                mask_obj = None
+            if torch.is_tensor(mask_obj):
+                mask = mask_obj.to(self.device)
+        return depth_supervision(
+            info["render_depth_acc"][0], render_alphas[0], target.to(self.device),
+            mask=mask,
+            loss_type=str(config.depth_loss_type),
+            huber_delta=float(config.depth_huber_delta),
+            mask_min=float(config.depth_loss_mask_min),
+            alpha_min=float(config.depth_alpha_min),
+            edge_px=int(config.depth_edge_px),
+            edge_rel_jump=float(config.depth_edge_rel_jump),
+            target_scale=float(config.depth_units_per_metre),
+            with_stats=with_stats,
+        )
 
     def _photometric_losses(
         self,
@@ -3964,7 +4039,7 @@ class TrigsTrainer:
     def _evaluate_psnr_subset(
         self, *, params, cameras, eval_pairs, sh_degree, config,
         gt_images_per_frame, gt_alphas_per_frame, gt_times_per_frame,
-        step: int,
+        step: int, gt_depths_per_frame=None,
     ) -> Dict[str, float]:
         if not eval_pairs:
             return {}
@@ -3974,20 +4049,28 @@ class TrigsTrainer:
             gt_images_per_frame=gt_images_per_frame,
             gt_alphas_per_frame=gt_alphas_per_frame,
             gt_times_per_frame=gt_times_per_frame, step=step,
+            gt_depths_per_frame=gt_depths_per_frame,
         ))
 
     @torch.no_grad()
     def _psnr_subset_accum(
         self, *, params, cameras, eval_pairs, sh_degree, config,
         gt_images_per_frame, gt_alphas_per_frame, gt_times_per_frame,
-        step: int,
+        step: int, gt_depths_per_frame=None,
     ) -> Dict[str, Any]:
         """Per-pair squared-error sums, so partial evals (one per temporal
-        chunk) combine into exactly the metrics of a single full eval."""
+        chunk) combine into exactly the metrics of a single full eval.
+        With ``gt_depths_per_frame``, also per-pixel depth errors (a bounded
+        random subsample per pair, so medians merge across chunks)."""
         sse_full = 0.0; denom_full = 0.0
         sse_masked = 0.0; denom_masked = 0.0
         image_psnrs_full: List[float] = []
         image_psnrs_masked: List[float] = []
+        depth_abs_m: List[Tensor] = []
+        depth_ratio: List[Tensor] = []
+        depth_n_target = 0
+        depth_n_covered = 0
+        with_depth = gt_depths_per_frame is not None
 
         for frame_idx, cam_idx in eval_pairs:
             t = self._eval_render_time(
@@ -4002,7 +4085,27 @@ class TrigsTrainer:
                 sh_degree,
                 config,
                 step=step,
+                **({"with_depth": True} if with_depth else {}),
             )
+            if with_depth:
+                dres = self._depth_loss_for_view(
+                    render_alphas, info, gt_depths_per_frame, gt_alphas_per_frame,
+                    frame_idx, cam_idx, config, with_stats=True,
+                )
+                if dres is not None:
+                    dstats = dres[1]
+                    depth_n_target += int(dstats["n_target"])
+                    depth_n_covered += int(dstats["n_covered"])
+                    err, ratio = dstats["abs_err"], dstats["ratio"]
+                    if err.numel() > 65536:
+                        gen = torch.Generator(device="cpu").manual_seed(
+                            int(frame_idx) * 1009 + int(cam_idx))
+                        sel = torch.randperm(int(err.numel()), generator=gen)[:65536]
+                        sel = sel.to(err.device)
+                        err, ratio = err[sel], ratio[sel]
+                    depth_abs_m.append(err.float().cpu())
+                    depth_ratio.append(ratio.float().cpu())
+                del dres
             pred = _as_float_rgb01(render_colors[0].detach(), clamp=config.psnr_clamp_rgb)
             gt = _as_float_rgb01(gt_images_per_frame[frame_idx][cam_idx].to(self.device),
                                   clamp=config.psnr_clamp_rgb)
@@ -4066,6 +4169,8 @@ class TrigsTrainer:
             "image_psnrs_full": image_psnrs_full,
             "image_psnrs_masked": image_psnrs_masked,
             "n_pairs": len(eval_pairs),
+            "depth_abs_m": depth_abs_m, "depth_ratio": depth_ratio,
+            "depth_n_target": depth_n_target, "depth_n_covered": depth_n_covered,
         }
 
     @staticmethod
@@ -4080,6 +4185,10 @@ class TrigsTrainer:
                 merged[key] += acc[key]
             merged["image_psnrs_full"] += list(acc["image_psnrs_full"])
             merged["image_psnrs_masked"] += list(acc["image_psnrs_masked"])
+            for key in ("depth_abs_m", "depth_ratio"):
+                merged.setdefault(key, []).extend(acc.get(key, []))
+            for key in ("depth_n_target", "depth_n_covered"):
+                merged[key] = merged.get(key, 0) + int(acc.get(key, 0))
         return merged
 
     @staticmethod
@@ -4103,6 +4212,19 @@ class TrigsTrainer:
             out["mask/eval_pixels_mean"] = float(
                 denom_masked / (3.0 * max(len(image_psnrs_masked), 1)))
         out["psnr/eval_num_samples"] = float(acc["n_pairs"])
+        depth_abs = acc.get("depth_abs_m") or []
+        if depth_abs:
+            err = torch.cat(depth_abs)
+            ratio = torch.cat(acc["depth_ratio"])
+            if err.numel():
+                out["depth/eval_median_abs_mm"] = float(err.median()) * 1000.0
+                out["depth/eval_mean_abs_mm"] = float(err.mean()) * 1000.0
+                out["depth/eval_p90_abs_mm"] = float(torch.quantile(err, 0.9)) * 1000.0
+                out["depth/eval_median_ratio"] = float(ratio.median())
+        if int(acc.get("depth_n_target", 0)) > 0:
+            # Fraction of supervisable target pixels the render covers with
+            # opacity >= depth_alpha_min (the error above is over those).
+            out["depth/eval_coverage"] = float(acc["depth_n_covered"]) / float(acc["depth_n_target"])
         return out
 
     @torch.no_grad()
@@ -4120,6 +4242,7 @@ class TrigsTrainer:
         gt_times_per_frame,
         cull_threshold: float,
         step: int,
+        gt_depths_per_frame=None,
     ) -> Dict[str, Dict[str, float]]:
         """psnr/eval_* (and psnr/holdout_*) for a chunked model.
 
@@ -4182,6 +4305,7 @@ class TrigsTrainer:
                         sh_degree=sh_degree, config=eval_config,
                         gt_images_per_frame=gt_images_per_frame,
                         gt_alphas_per_frame=gt_alphas_per_frame,
+                        gt_depths_per_frame=gt_depths_per_frame,
                         gt_times_per_frame=gt_times_per_frame, step=step,
                     ))
             del sub_params
@@ -4938,6 +5062,7 @@ class TrigsTrainer:
         frame_indices: Optional[List[int]] = None,
         frame_weights_override: Optional[Sequence[float]] = None,
         progress_bar: Optional[Any] = None,
+        gt_depths: Optional[Any] = None,
     ) -> Dict[str, Any]:
         from ..strategy.motion_guided_relocation import (
             MotionGuidedRelocationConfig,
@@ -4946,6 +5071,14 @@ class TrigsTrainer:
 
         gt_images_per_frame = gt_images
         gt_alphas_per_frame = gt_alphas
+        gt_depths_per_frame = gt_depths
+        # Depth is rendered whenever targets exist (lambda 0 still logs
+        # loss/depth for comparison); it only enters the loss when
+        # lambda_depth > 0 and step >= depth_loss_start_step.
+        render_depth = gt_depths_per_frame is not None
+        lambda_depth = float(getattr(config, "lambda_depth", 0.0))
+        if lambda_depth > 0.0 and not render_depth:
+            raise ValueError("lambda_depth > 0 needs depth targets (e.g. --depth-root)")
 
         train_seed = int(getattr(config, "train_seed", -1))
         if train_seed >= 0:
@@ -5323,6 +5456,17 @@ class TrigsTrainer:
             rgb_loss_sum = 0.0
             alpha_outside_sum = 0.0
             alpha_mask_sum = 0.0
+            depth_loss_sum = 0.0
+            depth_views = 0
+            depth_stats_step: List[Dict[str, Tensor]] = []
+            want_depth_stats = (
+                render_depth and writer is not None and config.tb_log_every > 0
+                and step % config.tb_log_every == 0
+            ) or (render_depth and step == 0)
+            depth_in_loss = (
+                render_depth and lambda_depth > 0.0
+                and step >= int(getattr(config, "depth_loss_start_step", 0))
+            )
             gamma = None
             active_parts: List[Tensor] = []
             for group_i, cam_idx in enumerate(cam_group):
@@ -5344,6 +5488,7 @@ class TrigsTrainer:
 
                 render_colors, render_alphas, cam_gamma, cam_info = self._render(
                     params, cameras, cam_idx, t, sh_degree, config, step=step,
+                    **({"with_depth": True} if render_depth else {}),
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -5369,6 +5514,20 @@ class TrigsTrainer:
                     + config.lambda_alpha_outside_mask * cam_alpha_out
                     + config.lambda_alpha_mask * cam_alpha_mask
                 )
+                if render_depth:
+                    dres = self._depth_loss_for_view(
+                        render_alphas, cam_info, gt_depths_per_frame, gt_alphas_per_frame,
+                        frame_idx, cam_idx, config, with_stats=want_depth_stats,
+                    )
+                    if dres is not None:
+                        cam_depth, cam_depth_stats = dres
+                        depth_loss_sum += float(cam_depth.detach())
+                        depth_views += 1
+                        if cam_depth_stats:
+                            depth_stats_step.append(cam_depth_stats)
+                        if depth_in_loss:
+                            cam_loss = cam_loss + lambda_depth * cam_depth
+                    del dres
                 if cam_loss.requires_grad:
                     (cam_loss / n_group).backward()
 
@@ -5393,6 +5552,31 @@ class TrigsTrainer:
                 del render_colors, render_alphas, cam_info, cam_loss
 
             gamma = gamma / float(n_group)
+            depth_loss = torch.tensor(depth_loss_sum / max(depth_views, 1))
+            if depth_stats_step:
+                with torch.no_grad():
+                    d_err = torch.cat([d["abs_err"].float() for d in depth_stats_step])
+                    d_ratio = torch.cat([d["ratio"].float() for d in depth_stats_step])
+                    n_tgt = sum(int(d["n_target"]) for d in depth_stats_step)
+                    n_cov = sum(int(d["n_covered"]) for d in depth_stats_step)
+                    depth_step_stats = {
+                        "depth/current_median_abs_mm": (
+                            float(d_err.median()) * 1000.0 if d_err.numel() else float("nan")),
+                        "depth/current_median_ratio": (
+                            float(d_ratio.median()) if d_ratio.numel() else float("nan")),
+                        "depth/current_coverage": float(n_cov) / max(float(n_tgt), 1.0),
+                    }
+                    del d_err, d_ratio
+                if step == 0 and config.verbose:
+                    print(
+                        "  Depth check @ step 0 (render/target inside mask): "
+                        f"median ratio={depth_step_stats['depth/current_median_ratio']:.4f}, "
+                        f"median |err|={depth_step_stats['depth/current_median_abs_mm']:.1f} mm, "
+                        f"coverage={depth_step_stats['depth/current_coverage']:.3f}, "
+                        f"loss/depth={float(depth_loss):.5f}"
+                    )
+            else:
+                depth_step_stats = {}
             rgb_loss = torch.tensor(rgb_loss_sum / n_group)
             alpha_outside_loss = torch.tensor(alpha_outside_sum / n_group)
             alpha_mask_loss = torch.tensor(alpha_mask_sum / n_group)
@@ -5401,6 +5585,8 @@ class TrigsTrainer:
                 + config.lambda_alpha_outside_mask * alpha_outside_loss
                 + config.lambda_alpha_mask * alpha_mask_loss
             )
+            if depth_in_loss:
+                photometric_total = photometric_total + lambda_depth * depth_loss
             step_active_idx = (
                 active_parts[0] if n_group == 1
                 else torch.unique(torch.cat(active_parts))
@@ -5563,6 +5749,11 @@ class TrigsTrainer:
                 writer.add_scalar("loss/sigma_floor", sigma_floor_loss.item(), step)
                 writer.add_scalar("loss/alpha_outside_mask", alpha_outside_loss.item(), step)
                 writer.add_scalar("loss/alpha_mask", alpha_mask_loss.item(), step)
+                if render_depth and depth_views > 0:
+                    writer.add_scalar("loss/depth", depth_loss.item(), step)
+                    for k, v in depth_step_stats.items():
+                        if math.isfinite(v):
+                            writer.add_scalar(k, v, step)
                 writer.add_scalar(
                     "loss/temporal_chunk_outside_mass",
                     chunk_outside_mass_loss.item(),
@@ -5903,6 +6094,8 @@ class TrigsTrainer:
                     "loss_reg": reg_loss.item(), "loss_sigma_floor": sigma_floor_loss.item(),
                     "loss_chunk_outside_mass": chunk_outside_mass_loss.item(),
                 }
+                if render_depth:
+                    snap["loss_depth"] = float(depth_loss)
                 metrics["snapshots"].append(snap)
                 if hasattr(bar, "set_postfix"):
                     if math.isfinite(psnr_masked):
@@ -5952,6 +6145,7 @@ class TrigsTrainer:
                             config=config,
                             gt_images_per_frame=gt_images_per_frame,
                             gt_alphas_per_frame=gt_alphas_per_frame,
+                            gt_depths_per_frame=gt_depths_per_frame,
                             gt_times_per_frame=gt_times_per_frame,
                             step=step,
                         )
@@ -5971,6 +6165,7 @@ class TrigsTrainer:
                                 config=config,
                                 gt_images_per_frame=gt_images_per_frame,
                                 gt_alphas_per_frame=gt_alphas_per_frame,
+                                gt_depths_per_frame=gt_depths_per_frame,
                                 gt_times_per_frame=gt_times_per_frame,
                                 step=step,
                             )

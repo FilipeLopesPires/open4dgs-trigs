@@ -423,6 +423,90 @@ shutter. Keep the appropriate rolling-shutter model enabled separately.
 Weak motion or inaccurate scene geometry can make timing difficult to infer,
 so compare reconstruction quality against a run with fixed timing.
 
+#### Depth supervision from measured depth
+
+With sparse rigs (e.g. six RGB-D cameras around a subject), the photometric
+loss fits the training views but leaves geometry under-constrained, and
+masked training removes the background as a depth anchor. When the cameras
+also measured metric depth, it can be used as a loss:
+
+```bash
+uv run --no-sync trigs-train-colmap \
+    --data-dir /path/to/colmap_data \
+    --output-dir /path/to/output \
+    --npz-path /path/to/keyframes.npz \
+    --masks-root /path/to/colmap_data/masks \
+    --config.masked-rgb-loss \
+    --depth-root /path/to/colmap_data/depth_registered \
+    --config.lambda-depth 1.0
+```
+
+Recommended `--config.lambda-depth`: 0.5–2, start at 1. On a six-Kinect
+capture (half-resolution depth, 400-step smoke runs) the median depth error
+inside the mask fell from 24 mm (lambda 0) to 19 mm (0.5) and 16 mm (2), the
+90th percentile from 121 mm to 87 mm and 73 mm, at a cost of 0.1–0.2 dB of
+masked training-view PSNR. The cameras' ToF depths disagree by 10–20 mm
+among themselves, so much larger weights mostly fit sensor bias.
+
+Depth input contract (mirrors `images/` and `masks/`):
+
+- `depth_root/<camera_folder>/<frame:06d>.png`: single-channel uint16,
+  metres = value × `--depth-scale` (default `0.001`, i.e. millimetres),
+  `0` = invalid; or `<frame:06d>.npy`: float32 metres, `0`/non-finite =
+  invalid. A missing `.png` falls back to the `.npy` of the same name.
+- Z-depth along the colour camera's optical axis, registered to the
+  undistorted colour image with the `sparse/0` intrinsics (the image the
+  trainer renders). Cameras with distortion parameters in the COLMAP model are
+  refused, because the trainer re-derives their pinhole camera and ROI crop.
+- Any resolution with the image's aspect ratio. Half resolution is typical;
+  the target is never upsampled. Frame numbering and camera folders are those
+  of `images/`. Missing files fail before training (first/last frame
+  checked) unless `--no-error-on-missing-depth`, which leaves that view
+  without depth supervision.
+
+How it works: the render is produced with gsplat `render_mode="RGB+D"`; the
+accumulated depth `Σ wᵢzᵢ` and opacity `Σ wᵢ` are area-pooled onto the depth
+map's grid and divided, giving the opacity-weighted expected depth over the
+render pixels each depth pixel covers. It is compared with the target where
+the target is valid, the mask is `>= --config.depth-loss-mask-min` (0.5;
+only when `--masks-root` is given), the pooled render opacity is
+`>= --config.depth-alpha-min` (0.5), and the target has no hole or relative
+jump larger than `--config.depth-edge-rel-jump` (0.05) within
+`--config.depth-edge-px` (1) depth pixels, which drops ToF flying pixels and
+mixed foreground/background samples at silhouettes.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `--depth-root` | none | Enables depth (metrics are logged even at lambda 0). |
+| `--depth-pattern` | `{frame:06d}.png` | File name inside each camera folder. |
+| `--depth-scale` | `0.001` | Metres per uint16 unit (PNG only). |
+| `--config.lambda-depth` | `0.0` | Loss weight; 0 keeps training unchanged. |
+| `--config.depth-loss-start-step` | `0` | First step the loss is applied. |
+| `--config.depth-loss-type` | `huber_log` | `huber_log`, `l1_log`, or `l1_inv`. |
+| `--config.depth-huber-delta` | `0.02` | Quadratic band of `huber_log`, in log-depth (about 2 %). |
+| `--config.depth-units-per-metre` | `1.0` | World units per metre (1 for a metric COLMAP model). |
+
+`huber_log` is a Huber loss on `log(rendered) − log(measured)`: a relative
+error, so near and far surfaces weigh alike and the weight does not depend on
+the world unit; quadratic within ±2 % (about ToF noise at 2 m), linear and
+therefore robust beyond it (multipath, residual flying pixels, cross-camera
+ToF bias of 1–2 cm). `l1_inv` is `|measured/rendered − 1|`, the relative error
+on inverse depth. The loss is frame-normalised like the alpha terms (summed
+over supervised pixels, divided by the number of depth pixels).
+
+Logged: `loss/depth` (also at lambda 0, for comparison runs),
+`depth/current_*` for the step's cameras, and with the PSNR eval
+`depth/eval_median_abs_mm`, `depth/eval_mean_abs_mm`, `depth/eval_p90_abs_mm`,
+`depth/eval_median_ratio` (rendered/measured; ~1 when units and registration
+agree) and `depth/eval_coverage` (fraction of supervisable target pixels the
+render covers), plus `depth/holdout_*` for held-out views. The first step
+also prints the median rendered/measured ratio as a units check.
+
+Cost: one extra rendered channel and two pooled maps per camera; the depth
+cache holds float32 maps on the host (`--depth-cache-size`, 300 by default,
+about 2 MB each at 540×960). Works with camera batching and temporal
+chunking.
+
 ### 3. SelfCap (4DV) mode
 
 Input: a SelfCap `<scene>-release` directory with `videos/`, `optimized/`,
