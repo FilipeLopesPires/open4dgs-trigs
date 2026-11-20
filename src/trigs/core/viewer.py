@@ -349,6 +349,9 @@ class ConfigTriGS:
     antialiased: bool  = False
     packed:      bool  = True
 
+    # World up axis for orbit controls ("+y", "-z", ...); None keeps viser's +Z
+    up_direction: Optional[str] = None
+
     # Performance
     precompute_visibility:    bool = True
     visibility_cache_frames:  int  = 300
@@ -1107,6 +1110,9 @@ class ViewerTriGS:
         self.play_speed    = cfg.fps
 
         self.server = viser.ViserServer(port=cfg.port, verbose=False)
+        if cfg.up_direction:
+            self.server.scene.set_up_direction(cfg.up_direction)
+            self.server.on_client_connect(self._init_client_camera)
         self._build_ui()
 
         self.viewer = nerfview.Viewer(
@@ -1114,6 +1120,32 @@ class ViewerTriGS:
             render_fn=self._render,
             mode="rendering",
         )
+
+    def _init_client_camera(self, client) -> None:
+        """Start an upright orbit: look at the splats' centre from the side, 1.5x their extent away."""
+        axis = {"x": 0, "y": 1, "z": 2}[self.cfg.up_direction[-1]]
+        up = np.zeros(3)
+        up[axis] = -1.0 if self.cfg.up_direction.startswith("-") else 1.0
+        client.camera.up_direction = up
+        if getattr(self, "splats", None) is None:   # --watch before the first snapshot
+            return
+        # Canonical `means` are motion anchors, not where splats render: use the
+        # positions of the visible splats at the current frame.
+        with self._splats_lock, torch.no_grad():
+            sp = self.splats
+            out = sp.get_at_time(frame=self.current_frame,
+                                 t_sec=sp._frame_to_secs(self.current_frame), apply_mask=True)
+            means, opac, mask = out[0], out[3], out[5]
+            keep = mask & (opac.reshape(-1) > 0.1)
+            pts = (means[keep] if bool(keep.any()) else means).detach().cpu().numpy()
+        lo, hi = np.percentile(pts, 5, axis=0), np.percentile(pts, 95, axis=0)
+        center = 0.5 * (lo + hi)
+        side = np.zeros(3)
+        side[(axis + 2) % 3] = 1.0
+        dist = max(1.5 * float(np.linalg.norm(hi - lo)), 1.0)
+        # Order matters: viser's position setter also shifts look_at by the same offset.
+        client.camera.position = center + dist * side + 0.25 * dist * up
+        client.camera.look_at = center
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -2002,6 +2034,11 @@ def main():
                         "snapshot's is the degree training currently renders "
                         "at), else 3")
     p.add_argument("--antialiased",  action="store_true")
+    p.add_argument("--up", choices=("+x", "+y", "+z", "-x", "-y", "-z"), default=None,
+                   help="World up axis for the orbit controls; also starts the camera "
+                        "level with the scene. Default: viser's +z. Calibrations with a "
+                        "floor-aligned world (e.g. prep/align/calibrate_azure_kinect.py) "
+                        "use +y")
     a = p.parse_args()
     if a.watch is None and a.ckpt is None:
         p.error("one of --ckpt or --watch is required")
@@ -2026,6 +2063,7 @@ def main():
         precompute_visibility      = not a.no_precompute,
         sh_degree                  = a.sh_degree,
         antialiased                = a.antialiased,
+        up_direction               = a.up,
     )
 
     ViewerTriGS(cfg).run()
