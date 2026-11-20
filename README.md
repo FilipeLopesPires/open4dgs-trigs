@@ -582,7 +582,8 @@ Useful options:
 | `--fps 60 --total-frames 300` | Override playback metadata with your capture's values. Without metadata or overrides, the viewer falls back to 30 fps and 300 frames. |
 | `--t-start <SECONDS> --t-end <SECONDS>` | Override the displayed time range. |
 | `--temporal-threshold <VALUE>` | Match the run's `temporal_active_threshold` when comparing the viewer with training. The viewer CLI defaults to `0.05`; the current trainer default is `0.01`. |
-| `--no-spatial-filter` | Disable the display's spatial outlier filter if expected content is missing. |
+| `--no-spatial-filter` | Disable the display's spatial outlier filter if expected content is missing. The filter hides splats beyond 1.1x the 95th-percentile distance from the splat centre, which can remove extremities such as the feet of a standing or seated person. |
+| `--up +y` | World up axis for the orbit controls (`+x`, `+y`, `+z`, `-x`, `-y`, `-z`); also starts the camera level with the scene and orbiting its centre. Without it the viewer uses viser's `+z`, so a `+Y`-up scene (floor-aligned calibrations) appears lying on its side. |
 | `--no-precompute` | Disable the per-frame visibility cache to reduce memory use. |
 | `--device cuda:1` | Use a second GPU when available. |
 | `--npz-path /path/to/keyframes.npz` | Enable source-cohort diagnostics when the original NPZ remains row-aligned with the model; unnecessary for normal viewing. |
