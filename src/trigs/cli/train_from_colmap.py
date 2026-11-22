@@ -310,6 +310,16 @@ class TrigsColmapArgs:
     depth_cache_size: int = 300
     """LRU cache size for lazy depth tensors (float32; ~2 MB each at 540x960)."""
 
+    depth_offsets_json: Path | None = None
+    """Optional per-camera depth corrections (e.g. prep/extract/k4a_depth_offsets.py's
+    depth_offsets.json): {"offsets_m": {"<camera_folder>": metres, ...}}, added to every
+    valid depth value of that camera at load (0 stays invalid). Cameras not listed get 0.
+    Corrects constant per-sensor ToF biases that make neighbouring cameras disagree."""
+
+    sh_degree: int = 3
+    """Spherical-harmonics degree of the colour model (0-3; NPZ/COLMAP paths). Lower
+    degrees have less view-dependent colour to overfit with few cameras."""
+
     error_on_missing_depth: bool = True
     """If True, raise when a depth map is missing. If False, that view is
     simply not depth-supervised."""
@@ -947,12 +957,35 @@ def _build_camera_time_offset_scale(
     return torch.tensor(scale_by_pos, dtype=torch.float32)
 
 
+def load_mask_with_confidence(path: Path, hw: tuple[int, int], warp: "RawWarp | None" = None) -> torch.Tensor:
+    """Read a mask PNG as a uint8 tensor [H, W, 1], or [H, W, 2] for a grey+alpha ("LA") PNG.
+
+    Channel 0 is the mask (the grey value; any other mode is converted to "L" as before).
+    For LA PNGs channel 1 is the alpha, read as the mask's confidence: 255 = known,
+    0 = unknown (the trainer leaves those pixels out of its mask losses; see
+    trigs.core.quality.split_mask_confidence). Both channels get the same warp and resize."""
+    H, W = int(hw[0]), int(hw[1])
+    img = Image.open(path)
+    channels = [img.convert("L")]
+    if img.mode == "LA":
+        channels.append(img.getchannel("A"))
+    out = []
+    for ch in channels:
+        if warp is not None:
+            ch = Image.fromarray(_warp_raw_like_dataset(np.asarray(ch), warp))
+        if ch.size != (W, H):
+            ch = ch.resize((W, H), Image.Resampling.BILINEAR)
+        out.append(np.asarray(ch, dtype=np.uint8))
+    return torch.from_numpy(np.stack(out, axis=-1).copy()).contiguous().cpu()
+
+
 class _LazyGTMasks:
     """
     Drop-in for gt_alphas_per_frame.
 
     Access pattern:
         gt_alphas[frame_offset][cam_pos] -> uint8 tensor [H, W, 1]
+        ([H, W, 2] for grey+alpha mask PNGs: mask, confidence)
 
     Mask layout:
         masks_root/<camera_folder>/<mask_pattern.format(frame=...)>
@@ -1094,22 +1127,26 @@ class _LazyGTMasks:
                 )
             return self._fallback_mask(frame_offset, cam_pos)
 
-        mask_img = Image.open(path).convert("L")
-        warp = self._raw_warps_by_pos[int(cam_pos)]
-        if warp is not None:
-            mask_img = Image.fromarray(_warp_raw_like_dataset(np.asarray(mask_img), warp))
-
-        # Ensure exact render/GT resolution.
-        if mask_img.size != (W, H):
-            mask_img = mask_img.resize((W, H), Image.Resampling.BILINEAR)
-
-        mask_np = np.asarray(mask_img, dtype=np.uint8).copy()
-        mask = torch.from_numpy(mask_np).unsqueeze(-1).contiguous().cpu()
+        mask = load_mask_with_confidence(path, (H, W), self._raw_warps_by_pos[int(cam_pos)])
 
         if len(self._cache) >= self._cache_size:
             self._cache.popitem(last=False)
         self._cache[key] = mask
         return mask
+
+def load_depth_offsets(path: Path, cam_folders_by_pos: Sequence[str]) -> List[float]:
+    """Per-camera depth corrections (metres to add) from a depth_offsets.json, in camera-position
+    order. The file maps camera folder -> metres under "offsets_m"; unlisted cameras get 0."""
+    import json
+    data = json.loads(Path(path).read_text())
+    table = data.get("offsets_m", data) if isinstance(data, dict) else None
+    if not isinstance(table, dict):
+        raise ValueError(f"{path}: expected an object with 'offsets_m': {{camera_folder: metres}}")
+    unknown = sorted(set(table) - set(cam_folders_by_pos))
+    if unknown:
+        log.warning("depth offsets for cameras not in the training set ignored: %s", unknown)
+    return [float(table.get(folder, 0.0)) for folder in cam_folders_by_pos]
+
 
 def _read_depth_metres(path: Path, depth_scale: float) -> np.ndarray:
     """Load a depth map as float32 metres; invalid pixels are 0."""
@@ -1166,8 +1203,12 @@ class _LazyGTDepths:
         cache_size: int = 300,
         error_on_missing: bool = True,
         raw_warps_by_pos: Sequence[RawWarp | None] | None = None,
+        offsets_m_by_pos: Sequence[float] | None = None,
     ) -> None:
         self._root = Path(depth_root)
+        self._offsets_m = [float(v) for v in (offsets_m_by_pos or [0.0] * len(cam_folders_by_pos))]
+        if len(self._offsets_m) != len(cam_folders_by_pos):
+            raise ValueError("offsets_m_by_pos and cam_folders_by_pos lengths differ")
         self._cam_folders_by_pos = list(cam_folders_by_pos)
         self._source_start_frame = int(source_start_frame)
         self._target_hw_by_pos = [(int(h), int(w)) for h, w in target_hw_by_pos]
@@ -1249,7 +1290,10 @@ class _LazyGTDepths:
                 )
             return None
         d = self._fit(_read_depth_metres(path, self._depth_scale), cam_pos, path)
-        tensor = torch.from_numpy(np.ascontiguousarray(d, dtype=np.float32))
+        off = self._offsets_m[int(cam_pos)]
+        if off != 0.0:
+            d = np.where(d > 0, np.maximum(d + np.float32(off), np.float32(1e-6)), np.float32(0.0))
+        tensor =torch.from_numpy(np.ascontiguousarray(d, dtype=np.float32))
         if len(self._cache) >= self._cache_size:
             self._cache.popitem(last=False)
         self._cache[key] = tensor
@@ -1881,7 +1925,13 @@ def build_colmap_scene(args: TrigsColmapArgs) -> ColmapScene:
 
     gt_depths = None
     if getattr(args, "depth_root", None) is not None:
+        depth_offsets = None
+        if getattr(args, "depth_offsets_json", None) is not None:
+            depth_offsets = load_depth_offsets(args.depth_offsets_json, cam_folders_by_pos)
+            log.info("Depth offsets from %s (mm, added to valid depth): %s", args.depth_offsets_json,
+                     ", ".join(f"{f} {o * 1000:+.1f}" for f, o in zip(cam_folders_by_pos, depth_offsets)))
         gt_depths = _LazyGTDepths(
+            offsets_m_by_pos=depth_offsets,
             depth_root=args.depth_root,
             cam_folders_by_pos=cam_folders_by_pos,
             source_start_frame=args.start_frame,
@@ -2046,6 +2096,10 @@ def main(args: TrigsColmapArgs | None = None) -> None:
         )
     if float(args.config.lambda_depth) > 0.0 and args.depth_root is None:
         raise ValueError("--config.lambda-depth > 0 requires --depth-root")
+    if not 0 <= int(args.sh_degree) <= 3:
+        raise ValueError(f"--sh-degree must be 0..3, got {args.sh_degree}")
+    if args.depth_offsets_json is not None and args.depth_root is None:
+        raise ValueError("--depth-offsets-json needs --depth-root")
     if args.end_frame < args.start_frame:
         raise ValueError(
             f"end_frame ({args.end_frame}) must be >= start_frame ({args.start_frame})"
@@ -2097,7 +2151,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
             local_twist_k=args.config.local_twist_k,
             local_twist_reg=args.config.local_twist_reg,
             init_sigma_t=args.config.init_sigma_t,
-            max_sh_degree=3,
+            max_sh_degree=int(args.sh_degree),
             omega_init=True,
             duration_init_mode=args.config.duration_init_mode,
             duration_min_s=args.config.duration_min_s,
@@ -2153,6 +2207,7 @@ def main(args: TrigsColmapArgs | None = None) -> None:
             source_frame_end=args.end_frame,
             keep_static_when_filtering=True,
             filter_to_local_keyframe_stride=True,
+            max_sh_degree=int(args.sh_degree),
             device=params_device,
             compute_device=args.device,
         )

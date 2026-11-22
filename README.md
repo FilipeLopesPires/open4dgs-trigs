@@ -507,6 +507,38 @@ cache holds float32 maps on the host (`--depth-cache-size`, 300 by default,
 about 2 MB each at 540×960). Works with camera batching and temporal
 chunking.
 
+#### Quality options for sparse rigs
+
+All off by default (defaults reproduce the previous training exactly).
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `--depth-offsets-json` | none | Per-camera depth corrections, `{"offsets_m": {"<camera_folder>": metres}}` (e.g. from `prep/extract/k4a_depth_offsets.py`), added to every valid depth value at load. Removes constant per-sensor ToF bias that makes neighbouring cameras disagree by 1–2 cm. |
+| `--config.depth-loss-final-scale` | `1.0` | Depth-loss schedule: `lambda-depth` until `--config.depth-loss-decay-start-step`, then log-linear down to `lambda-depth × final-scale` over `--config.depth-loss-decay-steps` (cumulative steps, also across chunks). 1 = constant. |
+| `--config.lambda-depth-distortion` | `0.0` | Ray compactness (2DGS-style distortion): `Σᵢⱼ wᵢwⱼ(zᵢ−zⱼ)² / z̄²` from rendered depth moments where the render's opacity ≥ `depth-alpha-min`; from `--config.depth-distortion-start-step`. One extra rasterization per camera while active. Logged as `loss/depth_distortion`. |
+| `--config.lambda-opacity-binary` | `0.0` | `mean a(1−a)` over the step's active rows from `--config.opacity-binary-start-step`: pushes translucent splats to 0 or 1. Logged as `loss/opacity_binary`. |
+| `--sh-degree` | `3` | SH degree of the colour model (0–3). |
+| `--config.learn-camera-appearance` | off | Per-camera RGB gain and bias (logged as `camera/gain_<i>`, `camera/bias_<i>`), applied in the loss and the eval. With `--config.masked-rgb-composite` the bias is premultiplied by the render's opacity, so the plate stays the plate. |
+| `--config.masked-rgb-random-bg` | off | Random composite plate per rendered camera (needs straight foregrounds, i.e. `--foregrounds-root`); eval stays on `masked-rgb-bg-color`. |
+| `--config.holdout-views` | none | Camera positions (0-based) left out of training and scored as `psnr/holdout_*`, `depth/holdout_*`: the only eval that measures novel views. |
+
+Masks with unknown pixels: a mask PNG may be grey+alpha (PIL mode `LA`).
+Grey is the mask as before; alpha is its confidence (255 known, 0 unknown,
+values between weight the pixel). Unknown pixels are left out of the
+alpha-mask and alpha-outside terms and, with
+`--config.mask-unknown-ignore-rgb` (default on), out of the masked/composite
+RGB loss and the masked eval metric. Plain greyscale masks mean "all known";
+tools that read masks with PIL `.convert("L")` or OpenCV `IMREAD_GRAYSCALE`
+see a normal mask.
+
+Eval metrics: `psnr/eval_masked` weights each pixel by the soft mask (with
+`--config.masked-rgb-composite` the GT is matted with the soft mask, exactly as
+in training; it used to be binarised at 0.5, which capped a perfect fit at
+about 30 dB on the six-Kinect capture). `psnr/eval_interior` scores the mask
+binarised at `--config.psnr-mask-threshold` and eroded by
+`--config.psnr-interior-erode-px` (6) pixels: the subject without its matting
+edge.
+
 ### 3. SelfCap (4DV) mode
 
 Input: a SelfCap `<scene>-release` directory with `videos/`, `optimized/`,
