@@ -1111,7 +1111,7 @@ class ViewerTriGS:
 
         self.server = viser.ViserServer(port=cfg.port, verbose=False)
         if cfg.up_direction:
-            self.server.scene.set_up_direction(cfg.up_direction)
+            self.server.scene.set_up_direction(cfg.up_direction)  # type: ignore[arg-type]  # validated by --up choices
             self.server.on_client_connect(self._init_client_camera)
         self._build_ui()
 
@@ -1123,9 +1123,10 @@ class ViewerTriGS:
 
     def _init_client_camera(self, client) -> None:
         """Start an upright orbit: look at the splats' centre from the side, 1.5x their extent away."""
-        axis = {"x": 0, "y": 1, "z": 2}[self.cfg.up_direction[-1]]
+        up_direction = self.cfg.up_direction or "+z"
+        axis = {"x": 0, "y": 1, "z": 2}[up_direction[-1]]
         up = np.zeros(3)
-        up[axis] = -1.0 if self.cfg.up_direction.startswith("-") else 1.0
+        up[axis] = -1.0 if up_direction.startswith("-") else 1.0
         client.camera.up_direction = up
         if getattr(self, "splats", None) is None:   # --watch before the first snapshot
             return

@@ -1924,17 +1924,19 @@ def build_colmap_scene(args: TrigsColmapArgs) -> ColmapScene:
         gt_alphas = _DummyGTAlphas()
 
     gt_depths = None
-    if getattr(args, "depth_root", None) is not None:
+    depth_root: Path | None = getattr(args, "depth_root", None)
+    if depth_root is not None:
         depth_offsets = None
-        if getattr(args, "depth_offsets_json", None) is not None:
-            depth_offsets = load_depth_offsets(args.depth_offsets_json, cam_folders_by_pos)
+        depth_offsets_json: Path | None = getattr(args, "depth_offsets_json", None)
+        if depth_offsets_json is not None:
+            depth_offsets = load_depth_offsets(depth_offsets_json, cam_folders_by_pos)
             log.info("Depth offsets from %s (mm, added to valid depth): %s", args.depth_offsets_json,
                      ", ".join(f"{f} {o * 1000:+.1f}" for f, o in zip(cam_folders_by_pos, depth_offsets)))
         gt_depths = _LazyGTDepths(
             offsets_m_by_pos=depth_offsets,
-            depth_root=args.depth_root,
+            depth_root=depth_root,
             cam_folders_by_pos=cam_folders_by_pos,
-            source_start_frame=args.start_frame,
+            source_start_frame=int(args.start_frame or 0),
             target_hw_by_pos=hw_by_pos,
             depth_pattern=args.depth_pattern,
             depth_scale=args.depth_scale,

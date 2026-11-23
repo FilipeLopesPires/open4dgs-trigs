@@ -3796,7 +3796,7 @@ class TrigsTrainer:
                     f"Got {type(mask_obj)}."
                 )
             gt_mask, known = split_mask_confidence(mask_obj.to(self.device))
-            hw = render_colors[0].shape[:2]
+            hw = (int(render_colors.shape[1]), int(render_colors.shape[2]))
             gt_mask = resize_hw1(gt_mask, hw).clamp(0.0, 1.0)
             if known is not None:
                 known = resize_hw1(known, hw).clamp(0.0, 1.0)
@@ -4141,9 +4141,12 @@ class TrigsTrainer:
         chunk) combine into exactly the metrics of a single full eval.
         With ``gt_depths_per_frame``, also per-pixel depth errors (a bounded
         random subsample per pair, so medians merge across chunks)."""
-        sse_full = 0.0; denom_full = 0.0
-        sse_masked = 0.0; denom_masked = 0.0
-        sse_interior = 0.0; denom_interior = 0.0
+        sse_full = 0.0
+        denom_full = 0.0
+        sse_masked = 0.0
+        denom_masked = 0.0
+        sse_interior = 0.0
+        denom_interior = 0.0
         image_psnrs_full: List[float] = []
         image_psnrs_masked: List[float] = []
         depth_abs_m: List[Tensor] = []
@@ -4255,7 +4258,8 @@ class TrigsTrainer:
             diff2 = (pred - gt).double().pow(2)
             sse_i = float(diff2.sum().item())
             denom_i = float(diff2.numel())
-            sse_full += sse_i; denom_full += denom_i
+            sse_full += sse_i
+            denom_full += denom_i
             mse_i = max(sse_i / max(denom_i, 1.0), 1e-12)
             image_psnrs_full.append(float(-10.0 * math.log10(mse_i)))
 
@@ -4266,7 +4270,8 @@ class TrigsTrainer:
                 denom_m_i = float((mask.sum() * pred.shape[-1]).item())
                 if denom_m_i > 0:
                     sse_m_i = float((diff2 * mask).sum().item())
-                    sse_masked += sse_m_i; denom_masked += denom_m_i
+                    sse_masked += sse_m_i
+                    denom_masked += denom_m_i
                     mse_m_i = max(sse_m_i / max(denom_m_i, 1.0), 1e-12)
                     image_psnrs_masked.append(float(-10.0 * math.log10(mse_m_i)))
             if interior is not None:
